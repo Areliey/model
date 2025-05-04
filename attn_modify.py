@@ -1,15 +1,18 @@
 import math
 import os
+
+import datasets
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import Trainer, TrainingArguments
+from peft import LoraConfig, TaskType
+from transformers import Trainer, TrainingArguments, DataCollatorForSeq2Seq
 from transformers import Qwen2Config, AutoModelForCausalLM, AutoModel, AutoConfig, Qwen2ForCausalLM, AutoTokenizer
 from typing import Optional, Tuple
 from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
-from bigmodelvis import Visualization
 from datasets import load_dataset
 from safetensors.torch import load_model, save_model
+from peft import PeftModel, PeftConfig
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -140,65 +143,136 @@ class MyQwen2Attn(nn.Module):
         # print("v shape:", v.shape)  # 应为 [B, num_heads, T, head_size]
 
         # 保持与原始输出格式一致
-        return y, None, past_key_value
+        return y, att
 
 
-def preprocess_function(examples):
-    return tokenizer(examples["text"], truncation=True, padding="max_length", max_length=512)
+def process_func(example):
+    MAX_LENGTH = 384    # Llama分词器会将一个中文字切分为多个token，因此需要放开一些最大长度，保证数据的完整性
+    input_ids, attention_mask, labels = [], [], []
+    instruction = tokenizer(f"<|start_header_id|>user<|end_header_id|>\n\n{example['instruction'] + example['input']}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n", add_special_tokens=False)  # add_special_tokens 不在开头加 special_tokens
+    response = tokenizer(f"{example['output']}<|eot_id|>", add_special_tokens=False)
+    input_ids = instruction["input_ids"] + response["input_ids"] + [tokenizer.pad_token_id]
+    attention_mask = instruction["attention_mask"] + response["attention_mask"] + [1]  # 因为eos token咱们也是要关注的所以 补充为1
+    labels = [-100] * len(instruction["input_ids"]) + response["input_ids"] + [tokenizer.pad_token_id]
+    if len(input_ids) > MAX_LENGTH:  # 做一个截断
+        input_ids = input_ids[:MAX_LENGTH]
+        attention_mask = attention_mask[:MAX_LENGTH]
+        labels = labels[:MAX_LENGTH]
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "labels": labels
+    }
 
 
 # 使用示例
 if __name__ == "__main__":
-    # # 替换类定义
     device = "cuda"  # the device to load the model onto
 
-    model_name = "Qwen/Qwen2-0.5B-Instruct"
-    # # modeling_qwen2.QWEN2_ATTENTION_CLASSES["sdpa"] = MyQwen2Attn
-    # # modeling_qwen2.Qwen2SdpaAttention = MyQwen2Attn
-    #
-    os.environ["http_proxy"] = "http://127.0.0.1:7897"
-    os.environ["https_proxy"] = "http://127.0.0.1:7897"
-
+    model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+    lora_path = './Qwen_lora'
+    
     original_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto", device_map="auto")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    config = AutoConfig.from_pretrained(model_name)
-    # # model.save_pretrained("./model")
-    model_vis = Visualization(original_model)
-    model_vis.structure_graph()
+    # tokenizer = AutoTokenizer.from_pretrained(model_name)
+    # # tokenizer.pad_token = tokenizer.eos_token
 
-    modified_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto", device_map="auto")
+    # # print(tokenizer.pad_token, tokenizer.pad_token_id, tokenizer.eos_token_id)
+
+    # config = AutoConfig.from_pretrained(model_name)
+
+    # modified_model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype="auto", device_map="auto")
+    # index = 1
+    # for layer in modified_model.model.layers:
+    #     layer.self_attn = MyQwen2Attn(config, index).to(device)
+    #     index = index + 1
+
+    # modified_model.to(device)
+
+    # ds = load_dataset("Congliu/Chinese-DeepSeek-R1-Distill-data-110k-SFT")
+    # ds = ds['train'].select_columns(['instruction', 'input', 'output'])
+    # tokenized_id = ds.map(process_func, remove_columns=ds.column_names)
+    # print(tokenized_id)
+
+    # modified_model.enable_input_require_grads()  # 开启梯度检查点时，要执行该方法
+    # print(modified_model.dtype)
+    # args = TrainingArguments(
+    #     output_dir="./output/Qwen2.5",
+    #     per_device_train_batch_size=4,
+    #     gradient_accumulation_steps=4,
+    #     logging_steps=10,
+    #     num_train_epochs=3,
+    #     save_steps=5000,
+    #     learning_rate=1e-4,
+    #     save_on_each_node=False,
+    #     gradient_checkpointing=True
+    # )
+
+    # trainer = Trainer(
+    #     model=modified_model,
+    #     args=args,
+    #     train_dataset=tokenized_id,
+    #     data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True),
+    # )
+    # trainer.train()
+
+    # peft_model_id = "./Qwen_lora"
+    # trainer.model.save_pretrained(peft_model_id)
+    # tokenizer.save_pretrained(peft_model_id)
+
+
+    # 以下是推理部分
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        inference_mode=False,  # 训练模式
+        r=8,  # Lora 秩
+        lora_alpha=32,  # Lora alaph，具体作用参见 Lora 原理
+        lora_dropout=0.1  # Dropout 比例
+    )
+
+    model_path = 'Qwen/Qwen2.5-0.5B-Instruct'
+    lora_path = '/root/autodl-tmp/Qwen/Qwen_lora'
+    
+    # 加载tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    
+    # 加载模型
+    model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto",torch_dtype=torch.bfloat16)
+    config = AutoConfig.from_pretrained(model_name)
+
     index = 1
-    for layer in modified_model.model.layers:
+    for layer in model.model.layers:
         layer.self_attn = MyQwen2Attn(config, index).to(device)
         index = index + 1
 
-    model_vis = Visualization(modified_model)
-    model_vis.structure_graph()
-    modified_model.to(device)
-    # # 前向传播测试
-    # input_ids = torch.randint(0, 1000, (1, 64)).to(device)
-    # output = modified_model(input_ids)
-    # print(f"输出形状：{output.logits.shape}")
 
+    # 加载lora权重
+    model = PeftModel.from_pretrained(model, model_id=lora_path, config=lora_config)
 
-    prompt = "给我介绍一下什么是大预言模型？"
+    
+    prompt = "给我讲一个哲学故事。"
     messages = [
-        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "system", "content": "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."},
         {"role": "user", "content": prompt}
     ]
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
-    model_inputs = tokenizer([text], return_tensors="pt").to(device)
-
-    generated_ids =modified_model.generate(
+    
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    print(tokenizer.eos_token)
+    model_inputs = tokenizer([text], return_tensors="pt").to('cuda')
+    
+    generated_ids = model.generate(
         model_inputs.input_ids,
-        max_new_tokens=60
+        max_new_tokens=512,
+        do_sample=True,
+        top_p=0.9, 
+        temperature=0.5, 
+        repetition_penalty=1.1,
+        eos_token_id=tokenizer.encode('<|im_end|>')[0],
     )
     generated_ids = [
         output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
     ]
-
+    
     response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    
+    print(response)

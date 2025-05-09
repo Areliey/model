@@ -1,7 +1,7 @@
 import os
 
 import torch
-from datasets import load_from_disk, load_metric
+from datasets import load_from_disk, load_metric, load_dataset
 from transformers import BertTokenizer, BertForSequenceClassification, BertModel, TrainingArguments, Trainer
 
 os.environ["http_proxy"] = "http://127.0.0.1:7897"
@@ -10,7 +10,7 @@ os.environ["https_proxy"] = "http://127.0.0.1:7897"
 class Dataset(torch.utils.data.Dataset):
     def __init__(self, split):
         
-        self.dataset = load_from_disk('../Dataset/data/ChnSentiCorp')
+        self.dataset = load_dataset("lansinuote/ChnSentiCorp")
         self.dataset = self.dataset.map(tokenize_func, batched=True)
         self.dataset = self.dataset[split]
 
@@ -51,7 +51,7 @@ def collate_fn(data):
 
     return input_ids, attention_mask, token_type_ids, labels
 
-datasets = load_from_disk('../Huggingface_Toturials/data/ChnSentiCorp')
+datasets = load_dataset("lansinuote/ChnSentiCorp")
 tokenized = datasets.map(tokenize_func, batched=True)
 train_dataset = tokenized['train']
 test_dataset = tokenized['test']
